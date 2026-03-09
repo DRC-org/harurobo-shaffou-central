@@ -24,6 +24,13 @@ constexpr uint16_t CONFIG_WRITE_ID = 0x7FF;
 // 速度モード指令フレームIDは 0x200 + CAN_ID
 constexpr uint16_t SPEED_CMD_BASE_ID = 0x200;
 constexpr uint16_t CENTRAL_CONTROL_CAN_ID = 0x000;
+constexpr uint16_t RING_HAND_1_CAN_ID = 0x200;
+constexpr uint16_t RING_HAND_2_CAN_ID = 0x201;
+constexpr uint16_t RING_LIFT_1_CAN_ID = 0x300;
+constexpr uint16_t RING_LIFT_2_CAN_ID = 0x301;
+constexpr uint16_t YAGURA_HAND_1_CAN_ID = 0x400;
+constexpr uint16_t YAGURA_HAND_2_CAN_ID = 0x401;
+constexpr uint16_t YAGURA_LIFT_CAN_ID = 0x500;
 constexpr uint16_t OMNI_MOTOR_CAN_IDS[] = {0x010, 0x011, 0x012, 0x013};
 constexpr uint16_t OMNI_FEEDBACK_IDS[] = {0x010, 0x011, 0x012, 0x013};
 constexpr size_t OMNI_WHEEL_COUNT = sizeof(OMNI_MOTOR_CAN_IDS) / sizeof(OMNI_MOTOR_CAN_IDS[0]);
@@ -109,26 +116,58 @@ void handleButtonInput()
   const bool circle = ps5.Circle();
   const bool square = ps5.Square();
 
+  if (ps5.event.button_down.r1)
+  {
+    Serial.println("PS5 input: R1 down");
+    sendCanMessage(RING_LIFT_1_CAN_ID, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+  }
+  else if (ps5.event.button_down.l1)
+  {
+    Serial.println("PS5 input: L1 down");
+    sendCanMessage(RING_LIFT_2_CAN_ID, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+  }
+  else if (ps5.event.button_down.r2)
+  {
+    Serial.println("PS5 input: R2 down");
+    sendCanMessage(RING_HAND_1_CAN_ID, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00);
+  }
+  else if (ps5.event.button_down.l2)
+  {
+    Serial.println("PS5 input: L2 down");
+    sendCanMessage(RING_HAND_2_CAN_ID, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00);
+  }
+  else if (ps5.event.button_down.up)
+  {
+    Serial.println("PS5 input: Up down");
+    sendCanMessage(YAGURA_HAND_1_CAN_ID, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+    sendCanMessage(YAGURA_HAND_2_CAN_ID, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+  }
+  else if (ps5.event.button_down.down)
+  {
+    Serial.println("PS5 input: Down down");
+    sendCanMessage(YAGURA_LIFT_CAN_ID, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00);
+  }
+
   if (circle && !prev_circle)
   {
     Serial.println("PS5 input: Circle down");
-    sendCanMessage(0x300, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00);
+    sendCanMessage(RING_LIFT_1_CAN_ID, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00);
   }
   else if (!circle && prev_circle)
   {
     Serial.println("PS5 input: Circle up");
-    sendCanMessage(0x300, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00);
+    sendCanMessage(RING_LIFT_1_CAN_ID, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00);
   }
 
   if (square && !prev_square)
   {
     Serial.println("PS5 input: Square down");
-    sendCanMessage(0x301, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00);
+    sendCanMessage(RING_LIFT_2_CAN_ID, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00);
   }
   else if (!square && prev_square)
   {
     Serial.println("PS5 input: Square up");
-    sendCanMessage(0x301, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00);
+    sendCanMessage(RING_LIFT_2_CAN_ID, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00);
   }
 
   prev_circle = circle;
@@ -205,7 +244,30 @@ void handleCanRx()
     poll_feedback(rx_msg);
 
     if (rxId == CENTRAL_CONTROL_CAN_ID)
-    { // 0x000は中央制御基板のCAN_ID
+    { // 各基板から中央制御基板への完了報告
+      const uint8_t report0 = rx_msg.data[0];
+      const uint8_t report1 = rx_msg.data[1];
+
+      if (report0 == 0x00 && report1 == 0x00)
+      {
+        Serial.println("[CAN REPORT] ring recovery complete");
+      }
+      else if (report0 == 0x00 && report1 == 0x01)
+      {
+        Serial.println("[CAN REPORT] ring placement complete");
+      }
+      else if (report0 == 0x00 && report1 == 0x02)
+      {
+        Serial.println("[CAN REPORT] ring honmaru placement complete");
+      }
+      else if (report0 == 0x01 && report1 == 0x00)
+      {
+        Serial.println("[CAN REPORT] yagura recovery complete");
+      }
+      else if (report0 == 0x02 && report1 == 0x00)
+      {
+        Serial.println("[CAN REPORT] yagura placement complete");
+      }
     }
   }
 }
