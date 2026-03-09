@@ -10,6 +10,7 @@
             "includePath": [
                 "/home/kotek/dev/platformio/harurobo-shaffou-central/include",
                 "/home/kotek/dev/platformio/harurobo-shaffou-central/src",
+                "/home/kotek/dev/platformio/harurobo-shaffou-central/.pio/libdeps/esp32dev/ps5Controller/src",
                 "/home/kotek/dev/platformio/harurobo-shaffou-central/.pio/libdeps/esp32dev/PS4Controller/src",
                 "/home/kotek/.platformio/packages/framework-arduinoespressif32-libs/esp32/include/newlib/platform_include",
                 "/home/kotek/.platformio/packages/framework-arduinoespressif32-libs/esp32/include/freertos/config/include",
@@ -360,6 +361,7 @@
                 "path": [
                     "/home/kotek/dev/platformio/harurobo-shaffou-central/include",
                     "/home/kotek/dev/platformio/harurobo-shaffou-central/src",
+                    "/home/kotek/dev/platformio/harurobo-shaffou-central/.pio/libdeps/esp32dev/ps5Controller/src",
                     "/home/kotek/dev/platformio/harurobo-shaffou-central/.pio/libdeps/esp32dev/PS4Controller/src",
                     "/home/kotek/.platformio/packages/framework-arduinoespressif32-libs/esp32/include/newlib/platform_include",
                     "/home/kotek/.platformio/packages/framework-arduinoespressif32-libs/esp32/include/freertos/config/include",
