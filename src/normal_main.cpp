@@ -4,8 +4,6 @@
 #include <cmath>
 #include "driver/twai.h"
 
-bool at_run = false; // 〇ボタンやその他を押すと、自動の一連の動作が起こる。□ボタンでは手動操作になる。自動操作中に□ボタンの影響が出るのを防ぐ。
-
 // 1. ピンの住所（TXは送信、RXは受信）
 #define CAN_TX_PIN GPIO_NUM_16
 #define CAN_RX_PIN GPIO_NUM_4
@@ -96,44 +94,45 @@ void sendCanMessage(uint32_t msg_id, uint8_t data0, uint8_t data1, uint8_t data2
   }
 }
 
-/// 未使用
-void handleAutoInput()
+void handleButtonInput()
 {
+  static bool prev_circle = false;
+  static bool prev_square = false;
+
   if (!ps5.isConnected())
   {
+    prev_circle = false;
+    prev_square = false;
     return;
   }
 
-  if (ps5.event.button_down.r1)
-  { // r1ボタンで機体右側のリングを回収する 0x200 0x300
-    at_run = true;
-    sendCanMessage(0x300, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+  const bool circle = ps5.Circle();
+  const bool square = ps5.Square();
+
+  if (circle && !prev_circle)
+  {
+    Serial.println("PS5 input: Circle down");
+    sendCanMessage(0x300, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00);
   }
-  else if (ps5.event.button_down.l1)
-  { // l1ボタンで機体左側のリングを回収する 0x201 0x301
-    sendCanMessage(0x301, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
-    at_run = true;
+  else if (!circle && prev_circle)
+  {
+    Serial.println("PS5 input: Circle up");
+    sendCanMessage(0x300, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00);
   }
-  else if (ps5.event.button_down.r2)
-  { // r2ボタンで機体右側のリングを設置する(〇ボタンの操作である程度櫓に近づけた後にやる操作なのでいきなりリングハンドSVMDにCANを送っている)
-    at_run = true;
-    sendCanMessage(0x200, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00);
+
+  if (square && !prev_square)
+  {
+    Serial.println("PS5 input: Square down");
+    sendCanMessage(0x301, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00);
   }
-  else if (ps5.event.button_down.l2)
-  { // l2ボタンで機体左側のリングを設置する(□ボタンの操作である程度櫓に近づけた後にやる操作なのでいきなりリングハンドSVMDにCANを送っている)
-    at_run = true;
-    sendCanMessage(0x201, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00);
+  else if (!square && prev_square)
+  {
+    Serial.println("PS5 input: Square up");
+    sendCanMessage(0x301, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00);
   }
-  else if (ps5.event.button_down.up)
-  { // 十字キー上で櫓を回収する
-    at_run = true;
-    sendCanMessage(0x400, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
-  }
-  else if (ps5.event.button_down.down)
-  { // 十字キー下で櫓を設置する
-    at_run = true;
-    sendCanMessage(0x500, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00);
-  }
+
+  prev_circle = circle;
+  prev_square = square;
 }
 
 void updateOmniTargetsFromController()
@@ -144,11 +143,6 @@ void updateOmniTargetsFromController()
     {
       g_wheel_speed_targets_rad_s[i] = 0.0f;
     }
-    return;
-  }
-
-  if (at_run == true)
-  {
     return;
   }
 
@@ -212,33 +206,6 @@ void handleCanRx()
 
     if (rxId == CENTRAL_CONTROL_CAN_ID)
     { // 0x000は中央制御基板のCAN_ID
-      uint8_t command_0 = rx_msg.data[0];
-      uint8_t command_1 = rx_msg.data[1];
-      uint8_t command_2 = rx_msg.data[2];
-      if (command_0 == 0x00 && command_1 == 0x00 && command_2 == 0x00)
-      { // 右リング回収操作終了
-        at_run = false;
-      }
-      else if (command_0 == 0x00 && command_1 == 0x01 && command_2 == 0x00)
-      { // 右リング設置操作終了
-        at_run = false;
-      }
-      else if (command_0 == 0x00 && command_1 == 0x00 && command_2 == 0x01)
-      { // 左リング回収操作終了
-        at_run = false;
-      }
-      else if (command_0 == 0x00 && command_1 == 0x01 && command_2 == 0x01)
-      { // 左リング設置操作終了
-        at_run = false;
-      }
-      else if (command_0 == 0x01 && command_1 == 0x00 && command_2 == 0x00)
-      { // 十字キー上操作終了
-        at_run = false;
-      }
-      else if (command_0 == 0x02 && command_1 == 0x00 && command_2 == 0x00)
-      { // 十字キー下操作終了
-        at_run = false;
-      }
     }
   }
 }
@@ -351,6 +318,7 @@ void loop()
   if (now - last_controller_read_ms >= CONTROLLER_READ_INTERVAL_MS)
   {
     last_controller_read_ms = now;
+    handleButtonInput();
     updateOmniTargetsFromController();
   }
 
@@ -375,14 +343,3 @@ void loop()
     }
   }
 }
-
-/*
-if (rxId == 0x000) {
-  uint8_t fromWhom = rx_msg.data[1]; // 誰からの報告か確認
-  if (fromWhom == 0) {
-     // リング1の自動モード終了
-  } else if (fromWhom == 1) {
-     // リング2の自動モード終了
-  }
-}
-*/
