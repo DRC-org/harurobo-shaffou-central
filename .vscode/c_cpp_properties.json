@@ -743,6 +743,10 @@
             ],
             "cStandard": "gnu17",
             "cppStandard": "gnu++20",
+            "forcedInclude": [
+                "/home/kotek/.platformio/packages/framework-arduinoespressif32-libs/esp32/include/esp_hw_support/include/esp_mac.h",
+                ""
+            ],
             "compilerPath": "/home/kotek/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32-elf-gcc",
             "compilerArgs": [
                 "-mlongcalls",
