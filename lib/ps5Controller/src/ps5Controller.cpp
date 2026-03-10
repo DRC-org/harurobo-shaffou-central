@@ -1,8 +1,19 @@
 #include "ps5Controller.h"
 
-#include <esp32-hal-bt-mem.h>
 #include <esp_bt_defs.h>
 #include <esp_bt_main.h>
+
+// Arduino core の新しめの版では、BT ライブラリが使われていることを
+// esp32-hal-bt.c 側へ伝えないと btStart() が失敗することがある。
+// ただし esp32-hal-bt-mem.h は環境によって公開されていないので、
+// ここでは弱い外部シンボルとして扱って、存在するときだけ立てる。
+extern "C" bool _btLibraryInUse __attribute__((weak));
+
+__attribute__((constructor)) static void _setBtLibraryInUseCompat() {
+  if (&_btLibraryInUse) {
+    _btLibraryInUse = true;
+  }
+}
 
 extern "C" {
 #include "ps5.h"
