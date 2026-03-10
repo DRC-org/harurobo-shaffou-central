@@ -37,8 +37,9 @@ constexpr size_t OMNI_WHEEL_COUNT = sizeof(OMNI_MOTOR_CAN_IDS) / sizeof(OMNI_MOT
 
 constexpr float OMNI_WHEEL_RADIUS_M = 0.051f;
 constexpr float OMNI_CENTER_TO_WHEEL_M = 0.2325f;
-constexpr float MAX_LINEAR_SPEED_M_S = 1.0f;
-constexpr float MAX_ANGULAR_SPEED_RAD_S = 2.0f;
+constexpr float MAX_LINEAR_SPEED_M_S = 0.6f;
+constexpr float MAX_ANGULAR_SPEED_RAD_S = 1.2f;
+constexpr float MAX_WHEEL_SPEED_RAD_S = 30.0f;
 constexpr float STICK_DEADZONE = 0.12f;
 
 float g_wheel_speed_targets_rad_s[OMNI_WHEEL_COUNT] = {};
@@ -192,15 +193,26 @@ void updateOmniTargetsFromController()
 
   // 青コート図の 0=前左, 1=前右, 2=後右, 3=後左 を基準にした X-drive オムニ変換
   const float wheel_linear_m_s[OMNI_WHEEL_COUNT] = {
-      vx_m_s + vy_m_s + rotation_term,
-      vx_m_s - vy_m_s + rotation_term,
-      -vx_m_s - vy_m_s + rotation_term,
-      -vx_m_s + vy_m_s + rotation_term,
+      -vx_m_s - vy_m_s - rotation_term,
+      -vx_m_s + vy_m_s - rotation_term,
+      vx_m_s + vy_m_s - rotation_term,
+      vx_m_s - vy_m_s - rotation_term,
   };
 
+  float max_abs_wheel_speed_rad_s = 0.0f;
   for (size_t i = 0; i < OMNI_WHEEL_COUNT; ++i)
   {
     g_wheel_speed_targets_rad_s[i] = wheel_linear_m_s[i] / OMNI_WHEEL_RADIUS_M;
+    max_abs_wheel_speed_rad_s = std::max(max_abs_wheel_speed_rad_s, std::fabs(g_wheel_speed_targets_rad_s[i]));
+  }
+
+  if (max_abs_wheel_speed_rad_s > MAX_WHEEL_SPEED_RAD_S)
+  {
+    const float scale = MAX_WHEEL_SPEED_RAD_S / max_abs_wheel_speed_rad_s;
+    for (size_t i = 0; i < OMNI_WHEEL_COUNT; ++i)
+    {
+      g_wheel_speed_targets_rad_s[i] *= scale;
+    }
   }
 }
 
