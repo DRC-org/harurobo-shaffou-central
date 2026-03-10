@@ -1,109 +1,284 @@
 #include <Arduino.h>
 #include <ps5Controller.h>
-#include <cstring>
 #include <cmath>
+#include <cstring>
 #include "driver/twai.h"
 
-// 1. ピンの住所（TXは送信、RXは受信）
+// =========================================================
+// 通常運転用のメインプログラム
+//
+// このファイルは次の順番で読めるように並べてある。
+//
+// 1. 設定値
+// 2. 低レベルの共通関数
+// 3. ボタン入力処理
+// 4. オムニ足回り計算
+// 5. CAN受信処理
+// 6. 初期化
+// 7. loop()
+//
+// このリポジトリ内の他ファイルとの関係:
+// - normal_main.cpp
+//   普段の運転で使う本番用
+// - dm_test_main.cpp
+//   DM モータ 1 台だけを回して確認する用
+// - dm_id_writer_main.cpp
+//   DM モータの CAN ID を書き換える用
+// =========================================================
+//
+// さらに処理の流れを具体的に書くと:
+// - setup()
+//   1. Serial を開始
+//   2. PS5 接続の準備
+//   3. CAN の開始
+//   4. DM モータ 4 台を速度モードにして Enable
+// - loop()
+//   1. PS5 のボタン/スティックを読む
+//   2. ボタンなら各機構へ CAN を送る
+//   3. スティックなら 4 輪の目標速度を計算する
+//   4. 4 輪の目標速度を DM モータへ送る
+//   5. CAN 受信があれば状態表示する
+//
+// どこを触れば何が変わるか:
+// - ボタン割り当て        → handleButtonInput()
+// - 足回りの計算式        → updateOmniTargetsFromController()
+// - 最高速度             → MAX_LINEAR_SPEED_M_S / MAX_ANGULAR_SPEED_RAD_S
+// - 車輪速度の上限       → MAX_WHEEL_SPEED_RAD_S
+// - DM モータの ID       → OMNI_MOTOR_CAN_IDS / OMNI_FEEDBACK_IDS
+
+// =========================================================
+// 1. 設定値
+// =========================================================
+
+// ESP32 と CAN トランシーバをつなぐピン
+// 配線を変えたらここも直す
 #define CAN_TX_PIN GPIO_NUM_16
 #define CAN_RX_PIN GPIO_NUM_4
 
+// シリアルモニタの通信速度
+// Arduino IDE / PlatformIO monitor 側も同じ値にする
+const uint32_t SERIAL_BAUD = 115200;
+
+// PS5 コントローラの MAC アドレス
+// 別のコントローラにしたらここを書き換える
+const char PS5_CONTROLLER_MAC[] = "7c:66:ef:84:dc:16";
+
+// loop() の各処理周期
+// 数字を小さくすると反応は速くなるが、CPUの仕事は増える
 const unsigned long CONTROLLER_READ_INTERVAL_MS = 10;
 const unsigned long RX_INTERVAL_MS = 2;
-const uint32_t SPEED_SEND_INTERVAL_MS = 50;
+const unsigned long SPEED_SEND_INTERVAL_MS = 50;
 
+// 最後に処理した時刻
+// millis() と比較して「そろそろ次をやるか」を決める
 unsigned long last_controller_read_ms = 0;
 unsigned long last_can_rx_ms = 0;
 unsigned long last_speed_send_ms = 0;
 
-constexpr uint32_t SERIAL_BAUD = 115200;
+// 中央制御基板や各機構の CAN ID
+// can_ring.csv / can_yagura.csv に合わせている
+const uint16_t CENTRAL_CONTROL_CAN_ID = 0x000;
+const uint16_t RING_HAND_1_CAN_ID = 0x200;
+const uint16_t RING_HAND_2_CAN_ID = 0x201;
+const uint16_t RING_LIFT_1_CAN_ID = 0x300;
+const uint16_t RING_LIFT_2_CAN_ID = 0x301;
+const uint16_t YAGURA_HAND_1_CAN_ID = 0x400;
+const uint16_t YAGURA_HAND_2_CAN_ID = 0x401;
+const uint16_t YAGURA_LIFT_CAN_ID = 0x500;
 
-constexpr uint32_t CTRL_MODE_REGISTER = 0x0A;
-constexpr uint32_t CTRL_MODE_VELOCITY = 3;
-constexpr uint16_t CONFIG_WRITE_ID = 0x7FF;
-// 速度モード指令フレームIDは 0x200 + CAN_ID
-constexpr uint16_t SPEED_CMD_BASE_ID = 0x200;
-constexpr uint16_t CENTRAL_CONTROL_CAN_ID = 0x000;
-constexpr uint16_t RING_HAND_1_CAN_ID = 0x200;
-constexpr uint16_t RING_HAND_2_CAN_ID = 0x201;
-constexpr uint16_t RING_LIFT_1_CAN_ID = 0x300;
-constexpr uint16_t RING_LIFT_2_CAN_ID = 0x301;
-constexpr uint16_t YAGURA_HAND_1_CAN_ID = 0x400;
-constexpr uint16_t YAGURA_HAND_2_CAN_ID = 0x401;
-constexpr uint16_t YAGURA_LIFT_CAN_ID = 0x500;
-constexpr uint16_t OMNI_MOTOR_CAN_IDS[] = {0x010, 0x011, 0x012, 0x013};
-constexpr uint16_t OMNI_FEEDBACK_IDS[] = {0x010, 0x011, 0x012, 0x013};
-constexpr size_t OMNI_WHEEL_COUNT = sizeof(OMNI_MOTOR_CAN_IDS) / sizeof(OMNI_MOTOR_CAN_IDS[0]);
+// DM モータ 4 台の ID
+// doc.md の 0,1,2,3 の順番に対応
+// 0 = 前左, 1 = 前右, 2 = 後右, 3 = 後左
+const int MOTOR_COUNT = 4;
+const uint16_t OMNI_MOTOR_CAN_IDS[MOTOR_COUNT] = {0x010, 0x011, 0x012, 0x013};
+const uint16_t OMNI_FEEDBACK_IDS[MOTOR_COUNT] = {0x010, 0x011, 0x012, 0x013};
 
-constexpr float OMNI_WHEEL_RADIUS_M = 0.051f;
-constexpr float OMNI_CENTER_TO_WHEEL_M = 0.2325f;
-constexpr float MAX_LINEAR_SPEED_M_S = 0.6f;
-constexpr float MAX_ANGULAR_SPEED_RAD_S = 1.2f;
-constexpr float MAX_WHEEL_SPEED_RAD_S = 30.0f;
-constexpr float STICK_DEADZONE = 0.12f;
+// DM モータ制御で使う ID / レジスタ
+// speed mode の設定と速度指令送信に使う
+const uint16_t DM_CONFIG_WRITE_ID = 0x7FF;
+const uint16_t DM_SPEED_COMMAND_BASE_ID = 0x200;
+const uint32_t DM_CTRL_MODE_REGISTER = 0x0A;
+const uint32_t DM_CTRL_MODE_VELOCITY = 3;
 
-float g_wheel_speed_targets_rad_s[OMNI_WHEEL_COUNT] = {};
+// doc.md のオムニパラメータ
+// 機体寸法が変わったらここも見直す
+const float OMNI_WHEEL_RADIUS_M = 0.051f;
+const float OMNI_CENTER_TO_WHEEL_M = 0.2325f;
 
-constexpr char PS5_CONTROLLER_MAC[] = "7c:66:ef:84:dc:16";
+// スティック最大時の機体目標速度
+// 速くしたい/遅くしたいときはまずここを調整する
+const float MAX_LINEAR_SPEED_M_S = 0.6f;
+const float MAX_ANGULAR_SPEED_RAD_S = 1.2f;
+
+// 4輪合成後の車輪速度上限
+// 一部の車輪だけ危険に速くならないようにするための上限
+const float MAX_WHEEL_SPEED_RAD_S = 30.0f;
+
+// スティックの遊び
+// 微小な入力ノイズで勝手に動かないようにする
+const float STICK_DEADZONE = 0.12f;
+
+// 現在の4輪目標速度 [rad/s]
+// updateOmniTargetsFromController() が更新し、
+// sendAllWheelSpeeds() がこの値を送る
+float wheel_target_rad_s[MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+// =========================================================
+// 2. 低レベルの共通関数
+// =========================================================
 
 void onPs5Connect()
 {
+  // 接続確認用のメッセージ
   Serial.println("PS5 connected");
 }
 
 void onPs5Disconnect()
 {
+  // 切断確認用のメッセージ
   Serial.println("PS5 disconnected");
 }
 
-float apply_deadzone(int8_t raw)
+float applyDeadzone(int8_t raw_value)
 {
-  const float normalized = static_cast<float>(raw) / 127.0f;
-  const float abs_value = std::fabs(normalized);
+  // PS5 のスティック値を -1.0 ～ 1.0 に正規化して、
+  // 小さい入力は 0 扱いにする
+  // 返り値は「計算用に使いやすいスティックの強さ」
+  float normalized = static_cast<float>(raw_value) / 127.0f;
+  float abs_value = std::fabs(normalized);
+
   if (abs_value < STICK_DEADZONE)
   {
     return 0.0f;
   }
 
-  const float sign = normalized >= 0.0f ? 1.0f : -1.0f;
-  const float remapped = (abs_value - STICK_DEADZONE) / (1.0f - STICK_DEADZONE);
-  return sign * remapped;
+  float sign = 1.0f;
+  if (normalized < 0.0f)
+  {
+    sign = -1.0f;
+  }
+
+  float scaled = (abs_value - STICK_DEADZONE) / (1.0f - STICK_DEADZONE);
+  return sign * scaled;
 }
 
-// 2. 手紙を送る関数（uint32_tはID用、uint8_tはデータ用）
-void sendCanMessage(uint32_t msg_id, uint8_t data0, uint8_t data1, uint8_t data2, uint8_t data3, uint8_t data4, uint8_t data5, uint8_t data6, uint8_t data7)
+void clearWheelTargets()
 {
-  twai_message_t message;
-  message.identifier = msg_id;
-  message.extd = 0;
-  message.data_length_code = 8;
-  message.data[0] = data0;
-  message.data[1] = data1;
-  message.data[2] = data2;
-  message.data[3] = data3;
-  message.data[4] = data4;
-  message.data[5] = data5;
-  message.data[6] = data6;
-  message.data[7] = data7;
-
-  /*
-    箱の準備,           CanMsg msg;,             twai_message_t message;
-    IDを入れる,       msg.id = 0x101;,           message.identifier = 0x101;
-    長さを入れる,      msg.data_length = 2;,     message.data_length_code = 2;
-    データを入れる,    msg.data[0] = 0x30;,      message.data[0] = 0x30;
-    送信する,         CAN.write(msg);,           twai_transmit(&message, ...);
-  */
-
-  // 住所(&)を教えて、10ミリ秒だけ粘って送信！
-  if (twai_transmit(&message, 0) == ESP_OK)
+  // 安全のため 4 輪目標速度を全部 0 にする
+  // PS5 が切れたときなどに使う
+  for (int i = 0; i < MOTOR_COUNT; i++)
   {
-    // %Xは16進数、%dは10進数で表示
-    Serial.printf("CAN Sent: ID 0x%X Data: %d, %d, %d, %d, %d, %d, %d, %d\n", msg_id, data0, data1, data2, data3, data4, data5, data6, data7);
+    wheel_target_rad_s[i] = 0.0f;
   }
 }
 
+bool isOmniFeedbackId(uint32_t can_id)
+{
+  // 受信 CAN ID が足回り 4 台のどれかかどうかを調べる
+  for (int i = 0; i < MOTOR_COUNT; i++)
+  {
+    if (OMNI_FEEDBACK_IDS[i] == can_id)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool sendCan8Bytes(uint16_t can_id,
+                   uint8_t d0, uint8_t d1, uint8_t d2, uint8_t d3,
+                   uint8_t d4, uint8_t d5, uint8_t d6, uint8_t d7)
+{
+  // 機構系の CAN コマンドはほぼ全部 8 バイト固定長で送る
+  // can_id が送信先、d0～d7 がデータ本体
+  twai_message_t message = {};
+  message.identifier = can_id;
+  message.extd = 0;
+  message.rtr = 0;
+  message.data_length_code = 8;
+  message.data[0] = d0;
+  message.data[1] = d1;
+  message.data[2] = d2;
+  message.data[3] = d3;
+  message.data[4] = d4;
+  message.data[5] = d5;
+  message.data[6] = d6;
+  message.data[7] = d7;
+
+  bool ok = twai_transmit(&message, 0) == ESP_OK;
+  if (ok)
+  {
+    Serial.printf("CAN Sent: ID 0x%03lX Data: %u, %u, %u, %u, %u, %u, %u, %u\n",
+                  static_cast<unsigned long>(can_id),
+                  d0, d1, d2, d3, d4, d5, d6, d7);
+  }
+  return ok;
+}
+
+bool sendCan4Bytes(uint16_t can_id, const uint8_t data[4])
+{
+  // DM モータの速度モードは float 4 バイトを送る
+  // 速度指令専用の小さい送信関数
+  twai_message_t message = {};
+  message.identifier = can_id;
+  message.extd = 0;
+  message.rtr = 0;
+  message.data_length_code = 4;
+  std::memcpy(message.data, data, 4);
+  return twai_transmit(&message, 0) == ESP_OK;
+}
+
+bool sendDmSpecialCommand(uint16_t motor_can_id, uint8_t command)
+{
+  // 0xFC = Enable, 0xFD = Disable, 0xFE = Zero 系
+  // setup() では 0xFC を送ってモータを有効化する
+  bool ok = sendCan8Bytes(motor_can_id, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, command);
+  Serial.printf("[DM-S3519] special cmd=0x%02X id=0x%03X (%s)\n",
+                command,
+                motor_can_id,
+                ok ? "OK" : "FAIL");
+  return ok;
+}
+
+void writeDmVelocityMode(uint16_t motor_can_id)
+{
+  // DM モータを速度モードに設定する
+  // setup() のとき毎回送っている
+  bool ok = sendCan8Bytes(
+      DM_CONFIG_WRITE_ID,
+      static_cast<uint8_t>(motor_can_id & 0xFF),
+      static_cast<uint8_t>((motor_can_id >> 8) & 0xFF),
+      0x55,
+      static_cast<uint8_t>(DM_CTRL_MODE_REGISTER),
+      static_cast<uint8_t>(DM_CTRL_MODE_VELOCITY & 0xFF),
+      static_cast<uint8_t>((DM_CTRL_MODE_VELOCITY >> 8) & 0xFF),
+      static_cast<uint8_t>((DM_CTRL_MODE_VELOCITY >> 16) & 0xFF),
+      static_cast<uint8_t>((DM_CTRL_MODE_VELOCITY >> 24) & 0xFF));
+
+  Serial.printf("[DM-S3519] write CTRL_MODE=3 id=0x%03X (%s)\n",
+                motor_can_id,
+                ok ? "OK" : "FAIL");
+}
+
+void sendDmVelocity(uint16_t motor_can_id, float target_rad_s)
+{
+  // speed mode の本体データは float 4 バイト
+  // target_rad_s は車輪角速度 [rad/s]
+  uint8_t payload[4] = {0, 0, 0, 0};
+  std::memcpy(payload, &target_rad_s, sizeof(float));
+
+  uint16_t can_id = DM_SPEED_COMMAND_BASE_ID + motor_can_id;
+  sendCan4Bytes(can_id, payload);
+}
+
+// =========================================================
+// 3. PS5 ボタン入力処理
+// =========================================================
+
 void handleButtonInput()
 {
+  // Circle / Square は押した瞬間と離した瞬間で別動作なので、
+  // 前回状態を記録してエッジ検出している
   static bool prev_circle = false;
   static bool prev_square = false;
 
@@ -114,283 +289,285 @@ void handleButtonInput()
     return;
   }
 
-  const bool circle = ps5.Circle();
-  const bool square = ps5.Square();
+  bool circle = ps5.Circle();
+  bool square = ps5.Square();
 
+  // ここは「ボタンを押したらどの CAN を送るか」の一覧
+  // 割り当てを変えたいときは、まずこの関数を見る
+  //
+  // 現在の割り当て:
+  // R1    : リング昇降1 降下
+  // L1    : リング昇降2 降下
+  // R2    : リングハンド1 閉
+  // L2    : リングハンド2 閉
+  // Up    : 櫓ハンド1/2 閉
+  // Down  : 櫓昇降 降下
+  // Circle: リング昇降1 手動開始/停止
+  // Square: リング昇降2 手動開始/停止
   if (ps5.event.button_down.r1)
   {
     Serial.println("PS5 input: R1 down");
-    sendCanMessage(RING_LIFT_1_CAN_ID, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+    sendCan8Bytes(RING_LIFT_1_CAN_ID, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
   }
   else if (ps5.event.button_down.l1)
   {
     Serial.println("PS5 input: L1 down");
-    sendCanMessage(RING_LIFT_2_CAN_ID, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+    sendCan8Bytes(RING_LIFT_2_CAN_ID, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
   }
   else if (ps5.event.button_down.r2)
   {
     Serial.println("PS5 input: R2 down");
-    sendCanMessage(RING_HAND_1_CAN_ID, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00);
+    sendCan8Bytes(RING_HAND_1_CAN_ID, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00);
   }
   else if (ps5.event.button_down.l2)
   {
     Serial.println("PS5 input: L2 down");
-    sendCanMessage(RING_HAND_2_CAN_ID, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00);
+    sendCan8Bytes(RING_HAND_2_CAN_ID, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00);
   }
   else if (ps5.event.button_down.up)
   {
     Serial.println("PS5 input: Up down");
-    sendCanMessage(YAGURA_HAND_1_CAN_ID, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
-    sendCanMessage(YAGURA_HAND_2_CAN_ID, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+    sendCan8Bytes(YAGURA_HAND_1_CAN_ID, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+    sendCan8Bytes(YAGURA_HAND_2_CAN_ID, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
   }
   else if (ps5.event.button_down.down)
   {
     Serial.println("PS5 input: Down down");
-    sendCanMessage(YAGURA_LIFT_CAN_ID, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00);
+    sendCan8Bytes(YAGURA_LIFT_CAN_ID, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00);
   }
 
   if (circle && !prev_circle)
   {
     Serial.println("PS5 input: Circle down");
-    sendCanMessage(RING_LIFT_1_CAN_ID, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00);
+    sendCan8Bytes(RING_LIFT_1_CAN_ID, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00);
   }
   else if (!circle && prev_circle)
   {
     Serial.println("PS5 input: Circle up");
-    sendCanMessage(RING_LIFT_1_CAN_ID, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00);
+    sendCan8Bytes(RING_LIFT_1_CAN_ID, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00);
   }
 
   if (square && !prev_square)
   {
     Serial.println("PS5 input: Square down");
-    sendCanMessage(RING_LIFT_2_CAN_ID, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00);
+    sendCan8Bytes(RING_LIFT_2_CAN_ID, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00);
   }
   else if (!square && prev_square)
   {
     Serial.println("PS5 input: Square up");
-    sendCanMessage(RING_LIFT_2_CAN_ID, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00);
+    sendCan8Bytes(RING_LIFT_2_CAN_ID, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00);
   }
 
   prev_circle = circle;
   prev_square = square;
 }
 
+// =========================================================
+// 4. オムニ足回り計算
+// =========================================================
+
 void updateOmniTargetsFromController()
 {
+  // この関数の役割:
+  // 「PS5 のスティック入力」→「4 輪の目標速度」
   if (!ps5.isConnected())
   {
-    for (size_t i = 0; i < OMNI_WHEEL_COUNT; ++i)
-    {
-      g_wheel_speed_targets_rad_s[i] = 0.0f;
-    }
+    clearWheelTargets();
     return;
   }
 
-  const float vx_m_s = apply_deadzone(ps5.LStickX()) * MAX_LINEAR_SPEED_M_S;
-  const float vy_m_s = apply_deadzone(ps5.LStickY()) * MAX_LINEAR_SPEED_M_S;
-  const float omega_rad_s = apply_deadzone(ps5.RStickX()) * MAX_ANGULAR_SPEED_RAD_S;
-  const float rotation_term = OMNI_CENTER_TO_WHEEL_M * omega_rad_s;
+  // 左スティックで平行移動、右スティックXで回転
+  // vx_m_s    : 左右移動速度
+  // vy_m_s    : 前後移動速度
+  // omega_rad_s : 機体の回転速度
+  float vx_m_s = applyDeadzone(ps5.LStickX()) * MAX_LINEAR_SPEED_M_S;
+  float vy_m_s = applyDeadzone(ps5.LStickY()) * MAX_LINEAR_SPEED_M_S;
+  float omega_rad_s = applyDeadzone(ps5.RStickX()) * MAX_ANGULAR_SPEED_RAD_S;
 
-  // 青コート図の 0=前左, 1=前右, 2=後右, 3=後左 を基準にした X-drive オムニ変換
-  const float wheel_linear_m_s[OMNI_WHEEL_COUNT] = {
-      -vx_m_s - vy_m_s - rotation_term,
-      -vx_m_s + vy_m_s - rotation_term,
-      vx_m_s + vy_m_s - rotation_term,
-      vx_m_s - vy_m_s - rotation_term,
-  };
+  // 中心からホイールまでの距離と角速度から、回転用の速度成分を作る
+  float rotation_term = OMNI_CENTER_TO_WHEEL_M * omega_rad_s;
 
-  float max_abs_wheel_speed_rad_s = 0.0f;
-  for (size_t i = 0; i < OMNI_WHEEL_COUNT; ++i)
+  // 青コートの配置に合わせた 4 輪の接線速度
+  // 0 = 前左, 1 = 前右, 2 = 後右, 3 = 後左
+  // 回転方向が想定と違うときは、まずこの4式を見る
+  // ここがオムニ足回りの中心式
+  float wheel_linear_m_s[MOTOR_COUNT];
+  wheel_linear_m_s[0] = -vx_m_s - vy_m_s - rotation_term;
+  wheel_linear_m_s[1] = -vx_m_s + vy_m_s - rotation_term;
+  wheel_linear_m_s[2] = vx_m_s + vy_m_s - rotation_term;
+  wheel_linear_m_s[3] = vx_m_s - vy_m_s - rotation_term;
+
+  // DM モータへ送る単位 rad/s に変換する
+  // m/s を wheel radius で割って角速度にする
+  float max_abs_speed = 0.0f;
+  for (int i = 0; i < MOTOR_COUNT; i++)
   {
-    g_wheel_speed_targets_rad_s[i] = wheel_linear_m_s[i] / OMNI_WHEEL_RADIUS_M;
-    max_abs_wheel_speed_rad_s = std::max(max_abs_wheel_speed_rad_s, std::fabs(g_wheel_speed_targets_rad_s[i]));
+    wheel_target_rad_s[i] = wheel_linear_m_s[i] / OMNI_WHEEL_RADIUS_M;
+
+    float abs_speed = std::fabs(wheel_target_rad_s[i]);
+    if (abs_speed > max_abs_speed)
+    {
+      max_abs_speed = abs_speed;
+    }
   }
 
-  if (max_abs_wheel_speed_rad_s > MAX_WHEEL_SPEED_RAD_S)
+  // どれか1輪でも上限を超えたら、4輪まとめて縮める
+  // こうすると、斜め移動 + 回転で一部の車輪だけ危険に速くなるのを防げる
+  // 方向や比率は保ったまま小さくする
+  if (max_abs_speed > MAX_WHEEL_SPEED_RAD_S)
   {
-    const float scale = MAX_WHEEL_SPEED_RAD_S / max_abs_wheel_speed_rad_s;
-    for (size_t i = 0; i < OMNI_WHEEL_COUNT; ++i)
+    float scale = MAX_WHEEL_SPEED_RAD_S / max_abs_speed;
+    for (int i = 0; i < MOTOR_COUNT; i++)
     {
-      g_wheel_speed_targets_rad_s[i] *= scale;
+      wheel_target_rad_s[i] = wheel_target_rad_s[i] * scale;
     }
   }
 }
 
-bool is_omni_feedback_id(uint32_t can_id)
+void printOmniTargets()
 {
-  for (size_t i = 0; i < OMNI_WHEEL_COUNT; ++i)
-  {
-    if (OMNI_FEEDBACK_IDS[i] == can_id)
-    {
-      return true;
-    }
-  }
-  return false;
+  // 今どんな速度を各輪へ送ろうとしているかを表示する
+  Serial.printf("[OMNI] w0=%.3f w1=%.3f w2=%.3f w3=%.3f\n",
+                wheel_target_rad_s[0],
+                wheel_target_rad_s[1],
+                wheel_target_rad_s[2],
+                wheel_target_rad_s[3]);
 }
 
-void poll_feedback(const twai_message_t &rx)
+void sendAllWheelSpeeds()
 {
-  if (rx.extd || rx.rtr || rx.data_length_code < 1 || !is_omni_feedback_id(rx.identifier))
+  // 4 輪分の目標速度をそのまま DM モータへ送る
+  for (int i = 0; i < MOTOR_COUNT; i++)
   {
-    return;
+    sendDmVelocity(OMNI_MOTOR_CAN_IDS[i], wheel_target_rad_s[i]);
   }
-
-  const uint8_t d0 = rx.data[0];
-  Serial.printf(
-      "[DM-S3519] feedback id=0x%03X d0=0x%02X (id_low=%u err_high=%u)\n",
-      rx.identifier,
-      d0,
-      d0 & 0x0F,
-      (d0 >> 4) & 0x0F);
 }
+
+// =========================================================
+// 5. CAN受信処理
+// =========================================================
 
 void handleCanRx()
 {
-  // 以下は、自動操作が終わったのを各arduinoからうけとり、こちらでも自動操作終わったことにするプログラム
-  twai_message_t rx_msg; // 受信用メッセージの箱
+  // 受信した 1 本のフレームを拾って、
+  // DM フィードバックか、各機構からの完了報告かを見分ける
+  twai_message_t message;
+  if (twai_receive(&message, 0) != ESP_OK)
+  {
+    return;
+  }
 
-  if (twai_receive(&rx_msg, 0) == ESP_OK)
-  {                                    // メッセージが届いているか確認（待ち時間0で一瞬だけ確認）
-    uint32_t rxId = rx_msg.identifier; // Arduinoの rxId = msg.id と同じ
+  if (!message.extd && !message.rtr && message.data_length_code >= 1 && isOmniFeedbackId(message.identifier))
+  {
+    // DM モータからの簡易状態表示
+    uint8_t d0 = message.data[0];
+    Serial.printf("[DM-S3519] feedback id=0x%03lX d0=0x%02X (id_low=%u err_high=%u)\n",
+                  static_cast<unsigned long>(message.identifier),
+                  d0,
+                  d0 & 0x0F,
+                  (d0 >> 4) & 0x0F);
+  }
 
-    poll_feedback(rx_msg);
+  if (message.identifier == CENTRAL_CONTROL_CAN_ID)
+  {
+    // 各機構から中央制御基板への「完了報告」
+    uint8_t report0 = message.data[0];
+    uint8_t report1 = message.data[1];
 
-    if (rxId == CENTRAL_CONTROL_CAN_ID)
-    { // 各基板から中央制御基板への完了報告
-      const uint8_t report0 = rx_msg.data[0];
-      const uint8_t report1 = rx_msg.data[1];
-
-      if (report0 == 0x00 && report1 == 0x00)
-      {
-        Serial.println("[CAN REPORT] ring recovery complete");
-      }
-      else if (report0 == 0x00 && report1 == 0x01)
-      {
-        Serial.println("[CAN REPORT] ring placement complete");
-      }
-      else if (report0 == 0x00 && report1 == 0x02)
-      {
-        Serial.println("[CAN REPORT] ring honmaru placement complete");
-      }
-      else if (report0 == 0x01 && report1 == 0x00)
-      {
-        Serial.println("[CAN REPORT] yagura recovery complete");
-      }
-      else if (report0 == 0x02 && report1 == 0x00)
-      {
-        Serial.println("[CAN REPORT] yagura placement complete");
-      }
+    if (report0 == 0x00 && report1 == 0x00)
+    {
+      Serial.println("[CAN REPORT] ring recovery complete");
+    }
+    else if (report0 == 0x00 && report1 == 0x01)
+    {
+      Serial.println("[CAN REPORT] ring placement complete");
+    }
+    else if (report0 == 0x00 && report1 == 0x02)
+    {
+      Serial.println("[CAN REPORT] ring honmaru placement complete");
+    }
+    else if (report0 == 0x01 && report1 == 0x00)
+    {
+      Serial.println("[CAN REPORT] yagura recovery complete");
+    }
+    else if (report0 == 0x02 && report1 == 0x00)
+    {
+      Serial.println("[CAN REPORT] yagura placement complete");
     }
   }
 }
 
-bool send_can_standard_8bytes(uint16_t id, const uint8_t data[8])
+// =========================================================
+// 6. 初期化
+// =========================================================
+
+void setupPs5()
 {
-  twai_message_t tx{};
-  tx.identifier = id;
-  tx.extd = 0;
-  tx.rtr = 0;
-  tx.data_length_code = 8;
-  std::memcpy(tx.data, data, 8);
-  return twai_transmit(&tx, 0) == ESP_OK;
-}
-
-///  「モーターへのリモコン命令」です。
-///  この関数はCANで
-///  FF FF FF FF FF FF FF コマンド
-///  という決まった形の8バイトを送って、モーター状態を切り替えます。
-///  - 0xFC で有効化（回せる状態）
-///  - 0xFD で無効化
-///  - 0xFE でゼロ位置系の指令
-///  このコードでは setup() で 0xFC を送って、最初にモーターを有効化しています。
-bool send_special_motor_command(uint16_t motor_can_id, uint8_t command)
-{
-  // DM系で使われる特殊コマンド形式 (0xFC:Enable / 0xFD:Disable / 0xFE:Zero)
-  uint8_t data[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, command};
-  const bool ok = send_can_standard_8bytes(motor_can_id, data);
-  Serial.printf("[DM-S3519] special cmd=0x%02X id=0x%03X (%s)\n", command, motor_can_id, ok ? "OK" : "FAIL");
-  return ok;
-}
-
-bool send_can_standard_4bytes(uint16_t id, const uint8_t data[4])
-{
-  twai_message_t tx{};
-  tx.identifier = id;
-  tx.extd = 0;
-  tx.rtr = 0;
-  tx.data_length_code = 4;
-  std::memcpy(tx.data, data, 4);
-  return twai_transmit(&tx, 0) == ESP_OK;
-}
-
-void write_ctrl_mode_velocity(uint16_t motor_can_id)
-{
-  // CAN設定コマンド:
-  // ID=0x7FF, D2=0x55(write), D3=RID(0x0A), D4..D7=3(velocity mode)
-  uint8_t data[8] = {};
-  data[0] = static_cast<uint8_t>(motor_can_id & 0xFF);
-  data[1] = static_cast<uint8_t>((motor_can_id >> 8) & 0xFF);
-  data[2] = 0x55;
-  data[3] = static_cast<uint8_t>(CTRL_MODE_REGISTER);
-  data[4] = static_cast<uint8_t>(CTRL_MODE_VELOCITY & 0xFF);
-  data[5] = static_cast<uint8_t>((CTRL_MODE_VELOCITY >> 8) & 0xFF);
-  data[6] = static_cast<uint8_t>((CTRL_MODE_VELOCITY >> 16) & 0xFF);
-  data[7] = static_cast<uint8_t>((CTRL_MODE_VELOCITY >> 24) & 0xFF);
-
-  const bool ok = send_can_standard_8bytes(CONFIG_WRITE_ID, data);
-  Serial.printf("[DM-S3519] write CTRL_MODE=3 id=0x%03X (%s)\n", motor_can_id, ok ? "OK" : "FAIL");
-}
-
-void send_velocity(uint16_t motor_can_id, float v_des_rad_s)
-{
-  // 速度モードでは payload は float(4byte, little-endian)
-  uint8_t payload[4] = {};
-  std::memcpy(payload, &v_des_rad_s, sizeof(float));
-  const uint16_t id = SPEED_CMD_BASE_ID + motor_can_id;
-  send_can_standard_4bytes(id, payload);
-}
-
-void setup()
-{
-  Serial.begin(SERIAL_BAUD);
-
+  // 接続時/切断時のイベントを登録してから begin() する
   ps5.attachOnConnect(onPs5Connect);
   ps5.attachOnDisconnect(onPs5Disconnect);
   ps5.begin(PS5_CONTROLLER_MAC);
+}
 
-  // 3. 3つの書類（設定）を作成
-
+void setupCan()
+{
+  // ESP32 の CAN(TWAI) を 1Mbps で開始する
   twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
   twai_timing_config_t t_config = TWAI_TIMING_CONFIG_1MBITS();
   twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
-  // 4. 書類を提出(install)して、OKならスイッチON(start)
   if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK)
   {
     twai_start();
     Serial.println("CAN Driver Started!");
   }
+}
 
-  // モータ側の起動直後を避けるため少し待ってから速度モード設定
+void enableAllDriveMotors()
+{
+  // 電源投入直後は少し待ってから設定する
   delay(200);
-  for (size_t i = 0; i < OMNI_WHEEL_COUNT; ++i)
+
+  // 先に速度モード設定、そのあと Enable
+  // setup() の中の「DM モータ初期化」担当
+  for (int i = 0; i < MOTOR_COUNT; i++)
   {
-    write_ctrl_mode_velocity(OMNI_MOTOR_CAN_IDS[i]);
+    writeDmVelocityMode(OMNI_MOTOR_CAN_IDS[i]);
     delay(20);
   }
-  for (size_t i = 0; i < OMNI_WHEEL_COUNT; ++i)
+
+  for (int i = 0; i < MOTOR_COUNT; i++)
   {
-    send_special_motor_command(OMNI_MOTOR_CAN_IDS[i], 0xFC);
+    sendDmSpecialCommand(OMNI_MOTOR_CAN_IDS[i], 0xFC);
     delay(20);
   }
 }
 
+// =========================================================
+// 7. Arduino の標準関数
+// =========================================================
+
+void setup()
+{
+  // Arduino 起動時に 1 回だけ実行される
+  // setup() の並び順が、そのまま起動手順
+  Serial.begin(SERIAL_BAUD);
+
+  setupPs5();
+  setupCan();
+  enableAllDriveMotors();
+}
+
 void loop()
 {
+  // loop() はずっと繰り返し呼ばれる
+  // delay() で止めずに、millis() で周期管理している
   unsigned long now = millis();
 
   if (now - last_controller_read_ms >= CONTROLLER_READ_INTERVAL_MS)
   {
+    // PS5 入力の読み取り
+    // ボタン処理と足回り目標更新をセットで行う
     last_controller_read_ms = now;
     handleButtonInput();
     updateOmniTargetsFromController();
@@ -398,22 +575,17 @@ void loop()
 
   if (now - last_can_rx_ms >= RX_INTERVAL_MS)
   {
+    // CAN 受信処理
     last_can_rx_ms = now;
     handleCanRx();
   }
 
   if (now - last_speed_send_ms >= SPEED_SEND_INTERVAL_MS)
   {
+    // 4 輪目標速度の表示と送信
+    // updateOmniTargetsFromController() が作った値をここで実際に送る
     last_speed_send_ms = now;
-    Serial.printf(
-        "[OMNI] w0=%.3f w1=%.3f w2=%.3f w3=%.3f\n",
-        g_wheel_speed_targets_rad_s[0],
-        g_wheel_speed_targets_rad_s[1],
-        g_wheel_speed_targets_rad_s[2],
-        g_wheel_speed_targets_rad_s[3]);
-    for (size_t i = 0; i < OMNI_WHEEL_COUNT; ++i)
-    {
-      send_velocity(OMNI_MOTOR_CAN_IDS[i], g_wheel_speed_targets_rad_s[i]);
-    }
+    printOmniTargets();
+    sendAllWheelSpeeds();
   }
 }
